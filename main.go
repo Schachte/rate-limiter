@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,20 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/go-redsync/redsync/v4"
+	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	"github.com/gomodule/redigo/redis"
+	goredislib "github.com/redis/go-redis/v9"
+
+	"github.com/nitishm/go-rejson/v4"
+	"github.com/nitishm/go-rejson/v4/rjs"
+)
+
+const (
+	UnableToProcess   = "unable to process request, please try again"
+	RateLimitExceeded = "rate limit exceeded, try again later"
+	MethodNotAllowed  = "method not allowed"
 )
 
 const (
@@ -20,14 +35,49 @@ const (
 	StandardUnit = time.Second
 )
 
+type RedisStore interface {
+	JSONGet(key, path string, opts ...rjs.GetOption) (res interface{}, err error)
+	JSONSet(key string, path string, obj interface{}, opts ...rjs.SetOption) (res interface{}, err error)
+}
+
+type RedisMutex interface {
+	NewMutex(name string, options ...redsync.Option) MutexLock
+}
+
+type MutexLock interface {
+	Lock() error
+	Unlock() (bool, error)
+}
+
+type RedisMutexHandler struct {
+	redSync *redsync.Redsync
+}
+
+type RedisMutexLock struct {
+	lock redsync.Mutex
+}
+
+func (m *RedisMutexHandler) NewMutex(name string, options ...redsync.Option) MutexLock {
+	return m.redSync.NewMutex(name)
+}
+
+func (m *RedisMutexLock) Lock() error {
+	return m.lock.Lock()
+}
+
+func (m *RedisMutexLock) Unlock() (bool, error) {
+	return m.lock.Unlock()
+}
+
 // CommentHandlerConfig contains all the information used to dynamically
 // configure our handler with different rates and storage providers
 type CommentHandlerConfig struct {
-	CommentStore   *Comments
-	BucketMap      map[string]*Bucket
-	BucketCapacity int
-	FillRate       time.Duration
-	FillUnit       time.Duration
+	RedisMu          RedisMutex
+	RedisJSONHandler RedisStore
+	CommentStore     *Comments
+	BucketCapacity   int
+	FillRate         time.Duration
+	FillUnit         time.Duration
 }
 
 // Comments simulates our persistence layer by storing all comments
@@ -52,18 +102,15 @@ type Comment struct {
 // Bucket is the abstraction used to rate limit users on a per-user level
 type Bucket struct {
 	// userIdentifier is the unique identification value used to track usage on a per-customer basis
-	userIdentifier string
+	UserIdentifier string `json:"UserIdentifier"`
 	// tokens is the capacity of a given bucket (number of tokens it's capable of holding)
-	tokens int
+	Tokens int `json:"Tokens"`
 	// fillRate is the fixed rate in which we add tokens to the bucket unless or until it's at capacity
-	fillRate time.Duration
+	FillRate time.Duration `json:"FillRate"`
 	// unit is the unit of measurement in which we fill the bucket (seconds, minutes, hours)
-	unit time.Duration
+	Unit time.Duration `json:"Unit"`
 	// lastChecked is the last recorded timestep in which we filled the bucket
-	lastChecked time.Time
-	// mu allows us to lock the mutation of a buckets tokens as it's a critical
-	// section of code that be mutated by multiple threads
-	mu sync.Mutex
+	LastChecked time.Time `json:"LastChecked"`
 }
 
 // handleComment will evaluate each comment on a per-user basis and determine if the comment should
@@ -81,21 +128,63 @@ func handleComment(config *CommentHandlerConfig) (func(w http.ResponseWriter, r 
 				return
 			}
 
-			// obtain the user to evaluate
-			userBucket, exists := config.BucketMap[newComment.UserIdentifier]
-			if !exists {
-				userBucket = &Bucket{
-					userIdentifier: newComment.UserIdentifier,
-					fillRate:       config.FillRate,
-					tokens:         config.BucketCapacity,
-					unit:           config.FillUnit,
+			mtx := config.RedisMu.NewMutex(fmt.Sprintf("%s-lock", newComment.UserIdentifier))
+			if err := mtx.Lock(); err != nil {
+				panic(err)
+			}
+			defer func() {
+				if ok, err := mtx.Unlock(); !ok || err != nil {
+					panic("unlock failed")
 				}
-				config.BucketMap[newComment.UserIdentifier] = userBucket
+			}()
+			userBucket := &Bucket{}
+			jsonData, err := config.RedisJSONHandler.JSONGet(newComment.UserIdentifier, ".")
+			if err != nil {
+				if err != goredislib.Nil {
+					http.Error(w, UnableToProcess, http.StatusInternalServerError)
+					return
+				}
+				// in this scenario, we just need to store the new user that we haven't processed before
+				userBucket = &Bucket{
+					UserIdentifier: newComment.UserIdentifier,
+					FillRate:       config.FillRate,
+					Tokens:         config.BucketCapacity,
+					Unit:           config.FillUnit,
+				}
+
+				// update the users bucket state after evaluation
+				_, err = config.RedisJSONHandler.JSONSet(newComment.UserIdentifier, ".", userBucket)
+
+				if err != nil {
+					http.Error(w, UnableToProcess, http.StatusInternalServerError)
+					return
+				}
+			} else {
+				// user already exist, pull the rate limiting state from Redis
+				// and deserialize it into the bucket
+				bucketJSON, err := redis.Bytes(jsonData, err)
+				if err != nil {
+					http.Error(w, UnableToProcess, http.StatusInternalServerError)
+					return
+				}
+
+				err = json.Unmarshal(bucketJSON, userBucket)
+				if err != nil {
+					http.Error(w, UnableToProcess, http.StatusInternalServerError)
+					return
+				}
 			}
 
-			err = userBucket.verifyCommentAllowance()
+			_, err = userBucket.verifyCommentAllowance()
 			if err != nil {
-				http.Error(w, "Rate limit exceeded, try again later", http.StatusTooManyRequests)
+				http.Error(w, RateLimitExceeded, http.StatusTooManyRequests)
+				return
+			}
+
+			// update the users bucket state after evaluation
+			_, err = config.RedisJSONHandler.JSONSet(newComment.UserIdentifier, ".", userBucket)
+			if err != nil {
+				http.Error(w, UnableToProcess, http.StatusInternalServerError)
 				return
 			}
 
@@ -104,21 +193,28 @@ func handleComment(config *CommentHandlerConfig) (func(w http.ResponseWriter, r 
 			w.WriteHeader(http.StatusCreated)
 			json.NewEncoder(w).Encode(newComment)
 		} else {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			http.Error(w, MethodNotAllowed, http.StatusMethodNotAllowed)
 		}
 	}, nil
 }
 
 func main() {
-	// In-memory map to track individual users and their rates and limits
-	userRateLimitTracker := make(map[string]*Bucket)
+	// var addr = flag.String("Server", "localhost:6379", "Redis server address")
+	// flag.Parse()
+
+	rs, rh := getRedSyncInstance()
 	handlerConfiguration := CommentHandlerConfig{
-		BucketMap:      userRateLimitTracker,
-		CommentStore:   &Comments{},
-		FillRate:       StandardFillRate,
-		BucketCapacity: StandardBucketCapacity,
-		FillUnit:       StandardUnit,
+		RedisJSONHandler: rh,
+		CommentStore:     &Comments{},
+		FillRate:         StandardFillRate,
+		BucketCapacity:   StandardBucketCapacity,
+		FillUnit:         StandardUnit,
 	}
+
+	redisMtxHandler := RedisMutexHandler{
+		redSync: rs,
+	}
+	handlerConfiguration.RedisMu = &redisMtxHandler
 	commentHandler, err := handleComment(&handlerConfiguration)
 	if err != nil {
 		log.Fatal("unable to initialize handler with missing configuration")
@@ -131,37 +227,32 @@ func main() {
 // verifyCommentAllowance will employ the token bucket algorithm which
 // will reference a specific users usage quota to determine if the comment
 // can be added or not.
-func (b *Bucket) verifyCommentAllowance() error {
-	// lock the bucket during evaluation of state
-	b.mu.Lock()
-	// avoid deadlock by auto unlocking the mutex when function execution
-	// completes
-	defer b.mu.Unlock()
+func (b *Bucket) verifyCommentAllowance() (time.Time, error) {
 	currentTime := time.Now()
 
 	// if the number of tokens is non-empty, we know the request is
 	// ok to process. From here, we can drain a token and update
 	// the evaluation time.
-	if b.tokens > 0 {
-		b.tokens--
-		b.lastChecked = currentTime
-		return nil
+	if b.Tokens > 0 {
+		b.Tokens--
+		b.LastChecked = currentTime
+		return currentTime, nil
 	}
 
 	// threshold calculates a delta between now and whatever our fill rate is in the past
 	// to evaluate if we're able to process the request or not.
-	threshold := currentTime.Add(-1 * b.fillRate * b.unit)
+	threshold := currentTime.Add(-1 * b.FillRate * b.Unit)
 
 	// If the current time is 11:00AM and the lastChecked time is 10:59AM
 	// we know that we can only add a token and process the request if
 	// the lastChecked time happened before the threshold
-	if b.lastChecked.Before(threshold) {
-		b.lastChecked = currentTime
-		return nil
+	if b.LastChecked.Before(threshold) {
+		b.LastChecked = currentTime
+		return currentTime, nil
 	}
 
-	return fmt.Errorf("unable to process comment as last added comment was: %v and current time is: %v",
-		b.lastChecked,
+	return time.Now(), fmt.Errorf("unable to process comment as last added comment was: %v and current time is: %v",
+		b.LastChecked,
 		currentTime,
 	)
 }
@@ -173,4 +264,16 @@ func (c *Comments) addComment(comment Comment) Comment {
 	comment.DateAdded = time.Now()
 	c.comments = append(c.comments, comment)
 	return comment
+}
+
+// TODO: Don't hardcode
+func getRedSyncInstance() (*redsync.Redsync, *rejson.Handler) {
+	client := goredislib.NewClient(&goredislib.Options{
+		Addr: "localhost:6379",
+	})
+	pool := goredis.NewPool(client)
+	rh := rejson.NewReJSONHandler()
+	rh.SetGoRedisClientWithContext(context.Background(), client)
+
+	return redsync.New(pool), rh
 }
