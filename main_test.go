@@ -85,7 +85,7 @@ func TestRateLimiter(t *testing.T) {
 		t.Parallel()
 		mockCache := make(map[string][]byte)
 		redisMutexHandler := MockRedisMutexHandler{}
-		handlerConfiguration := CommentHandlerConfig{
+		handlerConfiguration := RateLimitConfig{
 			RedisJSONHandler: &MockRedisHandler{
 				mockCache: mockCache,
 			},
@@ -93,9 +93,8 @@ func TestRateLimiter(t *testing.T) {
 			FillRate:       TestFillRate,
 			BucketCapacity: TestBucketCapacity,
 			FillUnit:       TestUnit,
-			CommentStore:   &Comments{},
 		}
-		commentHandler, err := handleComment(&handlerConfiguration)
+		commentHandler, err := rateLimitHandler(&handlerConfiguration)
 		require.NoError(t, err)
 
 		server := httptest.NewServer(http.HandlerFunc(commentHandler))
@@ -104,21 +103,18 @@ func TestRateLimiter(t *testing.T) {
 		uniqueUserIdentifier, err := uuid.NewRandom()
 		require.NoError(t, err)
 
-		newComment := Comment{
+		newReq := Request{
 			UserIdentifier: uniqueUserIdentifier.String(),
-			ArticleId:      1,
-			Name:           "Ryan S.",
-			Comment:        "Testing this blog system",
 		}
 
-		commentJSON, err := json.Marshal(newComment)
+		commentJSON, err := json.Marshal(newReq)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		req, err := http.NewRequest(
 			http.MethodPost,
-			fmt.Sprintf("%s/%s", server.URL, "comments"),
+			fmt.Sprintf("%s/%s", server.URL, "limiter"),
 			bytes.NewBuffer(commentJSON),
 		)
 		require.NoError(t, err)
@@ -130,25 +126,17 @@ func TestRateLimiter(t *testing.T) {
 
 		require.Equal(
 			t,
-			http.StatusCreated,
+			http.StatusOK,
 			resp.StatusCode,
-			"status codes should match as StatusCreated when rate limit not exceeded",
+			"status codes should match as StatusOK when rate limit not exceeded",
 		)
-
-		var createdComment Comment
-		err = json.NewDecoder(resp.Body).Decode(&createdComment)
-		require.NoError(t, err)
-
-		// Ensure comment created successfully
-		require.Equal(t, newComment.UserIdentifier, createdComment.UserIdentifier)
-		require.Equal(t, newComment.Comment, createdComment.Comment)
 	})
 
 	t.Run("rate limits apply and reject when token bucket is empty", func(t *testing.T) {
 		t.Parallel()
 		mockCache := make(map[string][]byte)
 		redisMutexHandler := MockRedisMutexHandler{}
-		handlerConfiguration := CommentHandlerConfig{
+		handlerConfiguration := RateLimitConfig{
 			RedisJSONHandler: &MockRedisHandler{
 				mockCache: mockCache,
 			},
@@ -156,9 +144,8 @@ func TestRateLimiter(t *testing.T) {
 			FillRate:       TestFillRate,
 			BucketCapacity: TestBucketCapacity,
 			FillUnit:       TestUnit,
-			CommentStore:   &Comments{},
 		}
-		commentHandler, err := handleComment(&handlerConfiguration)
+		commentHandler, err := rateLimitHandler(&handlerConfiguration)
 		require.NoError(t, err)
 
 		server := httptest.NewServer(http.HandlerFunc(commentHandler))
@@ -167,21 +154,18 @@ func TestRateLimiter(t *testing.T) {
 		uniqueUserIdentifier, err := uuid.NewRandom()
 		require.NoError(t, err)
 
-		newComment := Comment{
+		newReq := Request{
 			UserIdentifier: uniqueUserIdentifier.String(),
-			ArticleId:      1,
-			Name:           "Ryan S.",
-			Comment:        "Testing this blog system",
 		}
 
-		commentJSON, err := json.Marshal(newComment)
+		commentJSON, err := json.Marshal(newReq)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		req, err := http.NewRequest(
 			http.MethodPost,
-			fmt.Sprintf("%s/%s", server.URL, "comments"),
+			fmt.Sprintf("%s/%s", server.URL, "limiter"),
 			bytes.NewBuffer(commentJSON),
 		)
 		require.NoError(t, err)
@@ -193,16 +177,16 @@ func TestRateLimiter(t *testing.T) {
 
 		require.Equal(
 			t,
-			http.StatusCreated,
+			http.StatusOK,
 			resp.StatusCode,
-			"status codes should match as StatusCreated when rate limit not exceeded",
+			"status codes should match as StatusOK when rate limit not exceeded",
 		)
 
 		// immediately invoke another request which would violate the rate limit
 		// policy
 		req, err = http.NewRequest(
 			http.MethodPost,
-			fmt.Sprintf("%s/%s", server.URL, "comments"),
+			fmt.Sprintf("%s/%s", server.URL, "limiter"),
 			bytes.NewBuffer(commentJSON),
 		)
 		require.NoError(t, err)
@@ -222,7 +206,7 @@ func TestRateLimiter(t *testing.T) {
 
 		req, err = http.NewRequest(
 			http.MethodPost,
-			fmt.Sprintf("%s/%s", server.URL, "comments"),
+			fmt.Sprintf("%s/%s", server.URL, "limiter"),
 			bytes.NewBuffer(commentJSON),
 		)
 		require.NoError(t, err)
@@ -230,7 +214,7 @@ func TestRateLimiter(t *testing.T) {
 		resp, err = server.Client().Do(req)
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		require.Equal(t, http.StatusCreated, resp.StatusCode)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
 	})
 
 	t.Run("concurrent requests made from the same user can't bypass rate limits", func(t *testing.T) {
@@ -240,7 +224,7 @@ func TestRateLimiter(t *testing.T) {
 
 		mockCache := make(map[string][]byte)
 		redisMutexHandler := MockRedisMutexHandler{}
-		handlerConfiguration := CommentHandlerConfig{
+		handlerConfiguration := RateLimitConfig{
 			RedisJSONHandler: &MockRedisHandler{
 				mockCache: mockCache,
 			},
@@ -248,9 +232,8 @@ func TestRateLimiter(t *testing.T) {
 			FillRate:       10,
 			BucketCapacity: bucketCapacity,
 			FillUnit:       TestUnit,
-			CommentStore:   &Comments{},
 		}
-		commentHandler, err := handleComment(&handlerConfiguration)
+		commentHandler, err := rateLimitHandler(&handlerConfiguration)
 		require.NoError(t, err)
 
 		server := httptest.NewServer(http.HandlerFunc(commentHandler))
@@ -259,14 +242,11 @@ func TestRateLimiter(t *testing.T) {
 		uniqueUserIdentifier, err := uuid.NewRandom()
 		require.NoError(t, err)
 
-		newComment := Comment{
+		newReq := Request{
 			UserIdentifier: uniqueUserIdentifier.String(),
-			ArticleId:      1,
-			Name:           "Ryan S.",
-			Comment:        "Testing this blog system",
 		}
 
-		commentJSON, err := json.Marshal(newComment)
+		commentJSON, err := json.Marshal(newReq)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -277,7 +257,7 @@ func TestRateLimiter(t *testing.T) {
 		for i := 0; i < noConcurrentRequests; i++ {
 			req, err := http.NewRequest(
 				http.MethodPost,
-				fmt.Sprintf("%s/%s", server.URL, "comments"),
+				fmt.Sprintf("%s/%s", server.URL, "limiter"),
 				bytes.NewBuffer(commentJSON),
 			)
 			require.NoError(t, err)
@@ -285,20 +265,30 @@ func TestRateLimiter(t *testing.T) {
 			requestList = append(requestList, req)
 		}
 
-		requestInvoker := func(req *http.Request, wg *sync.WaitGroup) {
+		statusCodeAggregator := make(chan int, noConcurrentRequests)
+		requestInvoker := func(req *http.Request, wg *sync.WaitGroup, statusCodeChan chan int) {
 			defer wg.Done()
 			resp, err := server.Client().Do(req)
 			require.NoError(t, err)
 			defer resp.Body.Close()
+			statusCodeAggregator <- resp.StatusCode
 		}
 
 		for _, currentRequest := range requestList {
 			wg.Add(1)
-			go requestInvoker(currentRequest, &wg)
+			go requestInvoker(currentRequest, &wg, statusCodeAggregator)
 		}
 
 		// wait for all concurrent requests to complete
 		wg.Wait()
-		require.Len(t, handlerConfiguration.CommentStore.comments, bucketCapacity)
+		close(statusCodeAggregator)
+		successfullyProcessed := 0
+		for req := range statusCodeAggregator {
+			if req == http.StatusOK {
+				successfullyProcessed++
+			}
+		}
+
+		require.Equal(t, bucketCapacity, successfullyProcessed)
 	})
 }
