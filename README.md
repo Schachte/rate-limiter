@@ -13,4 +13,6 @@ This is a work in-progress, generic rate limiting system designed to be used as 
 - More generic configuration for sidecar proxy support
 - Drop-in replacements for distributed locking with `etcd`
 - Prometheus metric export
+- Logging
+- Better error handling/error messages
 - Blog article
