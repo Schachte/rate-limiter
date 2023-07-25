@@ -18,3 +18,12 @@ clean:
 wipe-cache:
 	$(GOCLEAN) -testcache -v ./...
 	
+.PHONY:
+run-dev:
+	@echo "Running docker"
+	@docker-compose up -d
+
+.PHONY:
+destroy-dev:
+	@echo "Destroying dev"
+	@docker-compose down -v

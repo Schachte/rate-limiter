@@ -63,12 +63,12 @@ See above example for usage.
 - `NewRateLimiter` can use the algorithm as a standard, importable library function
 - `StartServer` will execute an HTTP server for proxy usage to be used as a sidecar or self-hosted service
 
-## Build
+## Make
+
 ```sh
 make build
 ```
 
-## Tests
 ```sh
 # run test suite
 make test
@@ -77,9 +77,20 @@ make test
 make wipe-cache 
 ```
 
-## Clean
 ```sh
 make clean
+```
+
+## Docker
+
+You can run Redis via Docker easily
+
+```sh
+make run-dev
+```
+
+```sh
+make destroy-dev
 ```
 
 
