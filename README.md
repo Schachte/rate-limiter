@@ -53,16 +53,9 @@ if err != nil {
 - [Redlock](https://redis.com/glossary/redlock/) for distributed locking
 - [Redis](https://redis.io/) for optimized caching
 - Rate limiting with the [token bucket algorithm](https://en.wikipedia.org/wiki/Token_bucket)
-
-## In-Progress
-
-- More generic configuration for sidecar proxy support
-- Better error handling/error messages
-- Logging
-- Blog article
-
+- Easy to use library
+- Optional web proxy for sidecar usage
 
 ## Roadmap
 
-- Drop-in replacements for distributed locking with `etcd`
-- Prometheus metric export
+[Planning/Roadmap](https://github.com/users/Schachte/projects/4)
