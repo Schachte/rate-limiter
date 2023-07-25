@@ -3,7 +3,9 @@ package ratelimiter
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -20,7 +22,7 @@ import (
 
 const (
 	TestBucketCapacity = 1
-	TestFillRate       = 5
+	TestFillRate       = 2
 	TestUnit           = time.Second
 )
 
@@ -56,7 +58,9 @@ type MockRedisMutexHandler struct {
 }
 
 type MockRedisMutexLock struct {
-	mu *sync.Mutex
+	mu                    *sync.Mutex
+	acquisitionShouldFail bool
+	releaseShouldFail     bool
 }
 
 func (m *MockRedisMutexHandler) NewMutex(name string, options ...redsync.Option) MutexLock {
@@ -66,11 +70,17 @@ func (m *MockRedisMutexHandler) NewMutex(name string, options ...redsync.Option)
 }
 
 func (m *MockRedisMutexLock) Lock() error {
+	if m.acquisitionShouldFail {
+		return errors.New("acquiring lock failed")
+	}
 	m.mu.Lock()
 	return nil
 }
 
 func (m *MockRedisMutexLock) Unlock() (bool, error) {
+	if m.releaseShouldFail {
+		return false, errors.New("releasing lock failed")
+	}
 	m.mu.Unlock()
 	return true, nil
 }
@@ -128,6 +138,7 @@ func TestRateLimiter(t *testing.T) {
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
 			bytes.NewBuffer(commentJSON),
 		)
+		req.Header.Set("User-Identifier", uuid.NewString())
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
 
@@ -191,6 +202,7 @@ func TestRateLimiter(t *testing.T) {
 			bytes.NewBuffer(reqJSON),
 		)
 		require.NoError(t, err)
+		req.Header.Set("User-Identifier", uuid.NewString())
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := server.Client().Do(req)
@@ -211,6 +223,7 @@ func TestRateLimiter(t *testing.T) {
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
 			bytes.NewBuffer(reqJSON),
 		)
+		req.Header.Set("User-Identifier", uuid.NewString())
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err = server.Client().Do(req)
@@ -230,6 +243,7 @@ func TestRateLimiter(t *testing.T) {
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
 			bytes.NewBuffer(reqJSON),
 		)
+		req.Header.Set("User-Identifier", uuid.NewString())
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err = server.Client().Do(req)
@@ -286,12 +300,14 @@ func TestRateLimiter(t *testing.T) {
 		// store all the requests we want to invoke concurrently
 		var wg sync.WaitGroup
 		requestList := []*http.Request{}
+		userIdentifier := uuid.NewString()
 		for i := 0; i < noConcurrentRequests; i++ {
 			req, err := http.NewRequest(
 				http.MethodPost,
 				fmt.Sprintf("%s/%s", server.URL, "limiter"),
 				bytes.NewBuffer(commentJSON),
 			)
+			req.Header.Set("User-Identifier", userIdentifier)
 			require.NoError(t, err)
 			req.Header.Set("Content-Type", "application/json")
 			requestList = append(requestList, req)
@@ -322,5 +338,117 @@ func TestRateLimiter(t *testing.T) {
 		}
 
 		require.Equal(t, bucketCapacity, successfullyProcessed)
+	})
+
+	t.Run("missing User-Identifier on web proxy fails requeset", func(t *testing.T) {
+		t.Parallel()
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{}
+
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       TestFillRate,
+			BucketCapacity: TestBucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache: mockCache,
+			},
+		}
+
+		rateLimiter, err := NewRateLimiter(cfg)
+		require.NoError(t, err)
+
+		handler, err := rateLimiter.RateLimitHandler()
+		require.NoError(t, err)
+
+		server := httptest.NewServer(http.HandlerFunc(handler))
+		defer server.Close()
+
+		uniqueUserIdentifier, err := uuid.NewRandom()
+		require.NoError(t, err)
+
+		newReq := Request{
+			UserIdentifier: uniqueUserIdentifier.String(),
+		}
+
+		reqJSON, err := json.Marshal(newReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req, err := http.NewRequest(
+			http.MethodPost,
+			fmt.Sprintf("%s/%s", server.URL, "limiter"),
+			bytes.NewBuffer(reqJSON),
+		)
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := server.Client().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		respBody, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, MissingIdentifierHeader, string(respBody[0:len(respBody)-1]))
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
+}
+
+func TestRequestEvaluator(t *testing.T) {
+	t.Parallel()
+
+	mockCache := make(map[string][]byte)
+	redisMutexHandler := MockRedisMutexHandler{}
+	cfg := RateLimitConfig{
+		RedisHostname: "localhost",
+		RedisPort:     6379,
+		ServerHost:    "0.0.0.0",
+		ServerPort:    8080,
+
+		FillRate:       TestFillRate,
+		BucketCapacity: TestBucketCapacity,
+		FillUnit:       TestUnit,
+
+		RedisMu: &redisMutexHandler,
+		RedisJSONHandler: &MockRedisHandler{
+			mockCache: mockCache,
+		},
+	}
+
+	t.Run("fails when user identifier is missing", func(t *testing.T) {
+		t.Parallel()
+
+		rateLimiter, err := NewRateLimiter(cfg)
+		require.NoError(t, err)
+
+		err = rateLimiter.EvaluateRequest(Request{})
+		require.Error(t, err, MissingIdentifierHeader)
+	})
+
+	t.Run("fails when user identifier is missing", func(t *testing.T) {
+		t.Parallel()
+
+		rateLimiter, err := NewRateLimiter(cfg)
+		require.NoError(t, err)
+
+		err = rateLimiter.EvaluateRequest(Request{})
+		require.Error(t, err, MissingIdentifierHeader)
+	})
+
+	t.Run("fails when lock can't be acquired", func(t *testing.T) {
+		t.Parallel()
+
+		rateLimiter, err := NewRateLimiter(cfg)
+		require.NoError(t, err)
+
+		err = rateLimiter.EvaluateRequest(Request{})
+		require.Error(t, err, MissingIdentifierHeader)
 	})
 }

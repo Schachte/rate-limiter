@@ -16,15 +16,6 @@ import (
 	goredislib "github.com/redis/go-redis/v9"
 )
 
-type RedisStore interface {
-	JSONGet(key, path string, opts ...rjs.GetOption) (res interface{}, err error)
-	JSONSet(key string, path string, obj interface{}, opts ...rjs.SetOption) (res interface{}, err error)
-}
-
-type Request struct {
-	UserIdentifier string `json:"UserIdentifier"`
-}
-
 const (
 	// StandardBucketCapacity is the volume of the bucket per-user representing how many
 	// tokens will fit in the bucket
@@ -34,6 +25,17 @@ const (
 	// StandardUnit is the unit used to determine cadence of the token refill
 	StandardUnit = time.Second
 )
+
+type RedisStore interface {
+	JSONGet(key, path string, opts ...rjs.GetOption) (res interface{}, err error)
+	JSONSet(key string, path string, obj interface{}, opts ...rjs.SetOption) (res interface{}, err error)
+}
+
+// Request contains information required to uniquely identify a request. This
+// is typically pulled from the User-Identifier HTTP header for the sidecar proxy
+type Request struct {
+	UserIdentifier string `json:"UserIdentifier"`
+}
 
 // RateLimitConfig contains all the information used to dynamically
 // configure our handler with different rates and storage providers
@@ -68,14 +70,20 @@ type Bucket struct {
 	LastChecked time.Time `json:"LastChecked"`
 }
 
+// EvaluateRequest will lock the user identifier in Redis and evaluate if the configured
+// token limits for the user have been exceeded
 func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
+	if incomingReq.UserIdentifier == "" {
+		return NewUserIdentifierMissing()
+	}
 	mtx := r.cfg.RedisMu.NewMutex(fmt.Sprintf("%s-lock", incomingReq.UserIdentifier))
 	if err := mtx.Lock(); err != nil {
-		return fmt.Errorf("unable to acquire lock %v", err)
+		return NewUnableToAcquireLock().WithError(err)
 	}
 	defer func() {
+		// TODO: This return isn't handled properly
 		if ok, err := mtx.Unlock(); !ok || err != nil {
-			evalError = fmt.Errorf("unable to unlock mutex %v", err)
+			evalError = NewUnableToReleaseLock().WithError(err)
 		}
 	}()
 
@@ -83,7 +91,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 	jsonData, err := r.cfg.RedisJSONHandler.JSONGet(incomingReq.UserIdentifier, ".")
 	if err != nil {
 		if err != goredislib.Nil {
-			return fmt.Errorf("unable to retrieve key from redis store %v", err)
+			return NewUnableToGetJSONKey().WithError(err)
 		}
 
 		// in this scenario, we just need to store the new user that we haven't processed before
@@ -94,20 +102,19 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 			Unit:           r.cfg.FillUnit,
 		}
 
-		// update the users bucket state after evaluation
 		_, err = r.cfg.RedisJSONHandler.JSONSet(incomingReq.UserIdentifier, ".", userBucket)
 		if err != nil {
-			return fmt.Errorf("unable to set JSON data for user %v", err)
+			return NewUnableToSetJSONKey().WithError(err)
 		}
 	} else {
 		bucketJSON, err := redis.Bytes(jsonData, err)
 		if err != nil {
-			return fmt.Errorf("unable to deserialize JSON data %v", err)
+			return NewUnableToDeserialize().WithError(err)
 		}
 
 		err = json.Unmarshal(bucketJSON, userBucket)
 		if err != nil {
-			return fmt.Errorf("unable to deserialize JSON data from redis %v", err)
+			return NewUnableToDeserialize().WithError(err)
 		}
 	}
 
@@ -118,7 +125,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 
 	_, err = r.cfg.RedisJSONHandler.JSONSet(incomingReq.UserIdentifier, ".", userBucket)
 	if err != nil {
-		return fmt.Errorf("unable to persist updated rate limiting metadata %v", err)
+		return NewUnableToPersistMetadata().WithError(err)
 	}
 	return nil
 }
@@ -183,6 +190,12 @@ func NewRateLimiter(config RateLimitConfig) (RateLimiter, error) {
 func (l *RateLimiter) RateLimitHandler() (func(w http.ResponseWriter, r *http.Request), error) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
+			userIdentifier := r.Header.Get("User-Identifier")
+			if userIdentifier == "" {
+				http.Error(w, MissingIdentifierHeader, http.StatusBadRequest)
+				return
+			}
+
 			var newReq Request
 			err := json.NewDecoder(r.Body).Decode(&newReq)
 			if err != nil {
