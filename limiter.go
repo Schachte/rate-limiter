@@ -1,7 +1,6 @@
 package ratelimiter
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +10,6 @@ import (
 	"github.com/go-redsync/redsync/v4"
 	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	"github.com/gomodule/redigo/redis"
-	"github.com/nitishm/go-rejson/v4"
 	"github.com/nitishm/go-rejson/v4/rjs"
 	goredislib "github.com/redis/go-redis/v9"
 )
@@ -165,14 +163,9 @@ func (b *Bucket) verifyAllowance() (time.Time, error) {
 
 // GetRedSyncInstance will initialize redsync for distributed locking
 // and return the Redis JSON handler used for persisting JSON into Redis
-func GetRedSyncInstance(connection *string) (*redsync.Redsync, *rejson.Handler) {
-	client := goredislib.NewClient(&goredislib.Options{
-		Addr: *connection,
-	})
+func GetRedSyncInstance(client *goredislib.Client) *redsync.Redsync {
 	pool := goredis.NewPool(client)
-	rh := rejson.NewReJSONHandler()
-	rh.SetGoRedisClientWithContext(context.Background(), client)
-	return redsync.New(pool), rh
+	return redsync.New(pool)
 }
 
 // InitializeWebLimiter provides a web handler to leverage rate limiting via a web proxy

@@ -1,6 +1,8 @@
 package ratelimiter
 
-import "github.com/go-redsync/redsync/v4"
+import (
+	"github.com/go-redsync/redsync/v4"
+)
 
 type RedisMutex interface {
 	NewMutex(name string, options ...redsync.Option) MutexLock
