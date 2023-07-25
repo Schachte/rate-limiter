@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/go-redsync/redsync/v4"
 	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	"github.com/gomodule/redigo/redis"
 	"github.com/nitishm/go-rejson/v4"
 	"github.com/nitishm/go-rejson/v4/rjs"
 	goredislib "github.com/redis/go-redis/v9"
@@ -35,6 +39,15 @@ type RateLimitConfig struct {
 	BucketCapacity   int
 	FillRate         time.Duration
 	FillUnit         time.Duration
+	RedisHostname    string
+	RedisPort        int
+
+	ServerHost string
+	ServerPort int
+}
+
+type RateLimiter struct {
+	cfg RateLimitConfig
 }
 
 // Bucket is the abstraction used to rate limit users on a per-user level
@@ -49,6 +62,61 @@ type Bucket struct {
 	Unit time.Duration `json:"Unit"`
 	// lastChecked is the last recorded timestep in which we filled the bucket
 	LastChecked time.Time `json:"LastChecked"`
+}
+
+func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
+	mtx := r.cfg.RedisMu.NewMutex(fmt.Sprintf("%s-lock", incomingReq.UserIdentifier))
+	if err := mtx.Lock(); err != nil {
+		return fmt.Errorf("unable to acquire lock %v", err)
+	}
+	defer func() {
+		if ok, err := mtx.Unlock(); !ok || err != nil {
+			evalError = fmt.Errorf("unable to unlock mutex %v", err)
+		}
+	}()
+
+	userBucket := &Bucket{}
+	jsonData, err := r.cfg.RedisJSONHandler.JSONGet(incomingReq.UserIdentifier, ".")
+	if err != nil {
+		if err != goredislib.Nil {
+			return fmt.Errorf("unable to retrieve key from redis store %v", err)
+		}
+
+		// in this scenario, we just need to store the new user that we haven't processed before
+		userBucket = &Bucket{
+			UserIdentifier: incomingReq.UserIdentifier,
+			FillRate:       r.cfg.FillRate,
+			Tokens:         r.cfg.BucketCapacity,
+			Unit:           r.cfg.FillUnit,
+		}
+
+		// update the users bucket state after evaluation
+		_, err = r.cfg.RedisJSONHandler.JSONSet(incomingReq.UserIdentifier, ".", userBucket)
+		if err != nil {
+			return fmt.Errorf("unable to set JSON data for user %v", err)
+		}
+	} else {
+		bucketJSON, err := redis.Bytes(jsonData, err)
+		if err != nil {
+			return fmt.Errorf("unable to deserialize JSON data %v", err)
+		}
+
+		err = json.Unmarshal(bucketJSON, userBucket)
+		if err != nil {
+			return fmt.Errorf("unable to deserialize JSON data from redis %v", err)
+		}
+	}
+
+	_, err = userBucket.verifyAllowance()
+	if err != nil {
+		return errors.New(RateLimitExceeded)
+	}
+
+	_, err = r.cfg.RedisJSONHandler.JSONSet(incomingReq.UserIdentifier, ".", userBucket)
+	if err != nil {
+		return fmt.Errorf("unable to persist updated rate limiting metadata %v", err)
+	}
+	return nil
 }
 
 // verifyAllowance will employ the token bucket algorithm which
@@ -94,4 +162,61 @@ func GetRedSyncInstance(connection *string) (*redsync.Redsync, *rejson.Handler) 
 	rh := rejson.NewReJSONHandler()
 	rh.SetGoRedisClientWithContext(context.Background(), client)
 	return redsync.New(pool), rh
+}
+
+// InitializeWebLimiter provides a web handler to leverage rate limiting via a web proxy
+// or sidecar container. This is a good choice when deploying usage for all applications if you
+// prefer to avoid embedding rate limiting logic directly into your application code.
+func NewRateLimiter(config RateLimitConfig) (RateLimiter, error) {
+	//TODO: Add validation here
+	return RateLimiter{
+		config,
+	}, nil
+}
+
+// RateLimitHandler will evaluate each request on a per-user basis and determine if the request should
+// be permitted
+func (l *RateLimiter) RateLimitHandler() (func(w http.ResponseWriter, r *http.Request), error) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var newReq Request
+			err := json.NewDecoder(r.Body).Decode(&newReq)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			err = l.EvaluateRequest(newReq)
+			if err != nil {
+				if err.Error() == RateLimitExceeded {
+					w.WriteHeader(http.StatusTooManyRequests)
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, MethodNotAllowed, http.StatusMethodNotAllowed)
+	}, nil
+}
+
+// StartServer will run a web server that can receive requests
+// for rate limit evaluation
+func (r *RateLimiter) StartServer() error {
+	rateLimiter, err := r.RateLimitHandler()
+	if err != nil {
+		return errors.New("unable to initialize rate limit handler")
+	}
+
+	http.HandleFunc("/limiter", rateLimiter)
+	fmt.Printf("Running server at %s:%d\n", r.cfg.ServerHost, r.cfg.ServerPort)
+	return http.ListenAndServe(
+		fmt.Sprintf(
+			"%s:%d",
+			r.cfg.ServerHost,
+			r.cfg.ServerPort,
+		), nil)
 }

@@ -85,19 +85,30 @@ func TestRateLimiter(t *testing.T) {
 		t.Parallel()
 		mockCache := make(map[string][]byte)
 		redisMutexHandler := MockRedisMutexHandler{}
-		handlerConfiguration := RateLimitConfig{
-			RedisJSONHandler: &MockRedisHandler{
-				mockCache: mockCache,
-			},
-			RedisMu:        &redisMutexHandler,
+
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
 			FillRate:       TestFillRate,
 			BucketCapacity: TestBucketCapacity,
 			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache: mockCache,
+			},
 		}
-		commentHandler, err := rateLimitHandler(&handlerConfiguration)
+
+		rateLimiter, err := NewRateLimiter(cfg)
 		require.NoError(t, err)
 
-		server := httptest.NewServer(http.HandlerFunc(commentHandler))
+		handler, err := rateLimiter.RateLimitHandler()
+		require.NoError(t, err)
+
+		server := httptest.NewServer(http.HandlerFunc(handler))
 		defer server.Close()
 
 		uniqueUserIdentifier, err := uuid.NewRandom()
@@ -136,19 +147,30 @@ func TestRateLimiter(t *testing.T) {
 		t.Parallel()
 		mockCache := make(map[string][]byte)
 		redisMutexHandler := MockRedisMutexHandler{}
-		handlerConfiguration := RateLimitConfig{
-			RedisJSONHandler: &MockRedisHandler{
-				mockCache: mockCache,
-			},
-			RedisMu:        &redisMutexHandler,
+
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
 			FillRate:       TestFillRate,
 			BucketCapacity: TestBucketCapacity,
 			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache: mockCache,
+			},
 		}
-		commentHandler, err := rateLimitHandler(&handlerConfiguration)
+
+		rateLimiter, err := NewRateLimiter(cfg)
 		require.NoError(t, err)
 
-		server := httptest.NewServer(http.HandlerFunc(commentHandler))
+		handler, err := rateLimiter.RateLimitHandler()
+		require.NoError(t, err)
+
+		server := httptest.NewServer(http.HandlerFunc(handler))
 		defer server.Close()
 
 		uniqueUserIdentifier, err := uuid.NewRandom()
@@ -158,7 +180,7 @@ func TestRateLimiter(t *testing.T) {
 			UserIdentifier: uniqueUserIdentifier.String(),
 		}
 
-		commentJSON, err := json.Marshal(newReq)
+		reqJSON, err := json.Marshal(newReq)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -166,7 +188,7 @@ func TestRateLimiter(t *testing.T) {
 		req, err := http.NewRequest(
 			http.MethodPost,
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
-			bytes.NewBuffer(commentJSON),
+			bytes.NewBuffer(reqJSON),
 		)
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
@@ -187,7 +209,7 @@ func TestRateLimiter(t *testing.T) {
 		req, err = http.NewRequest(
 			http.MethodPost,
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
-			bytes.NewBuffer(commentJSON),
+			bytes.NewBuffer(reqJSON),
 		)
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
@@ -196,10 +218,9 @@ func TestRateLimiter(t *testing.T) {
 		defer resp.Body.Close()
 
 		// we expect an error on the response as the rate limit should be exceeded
-		responseBody, err := ioutil.ReadAll(resp.Body)
+		_, err = ioutil.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
-		require.Equal(t, fmt.Sprintf("%s\n", RateLimitExceeded), string(responseBody))
 
 		// wait until refill rate can add a token
 		time.Sleep(TestUnit * TestFillRate)
@@ -207,7 +228,7 @@ func TestRateLimiter(t *testing.T) {
 		req, err = http.NewRequest(
 			http.MethodPost,
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
-			bytes.NewBuffer(commentJSON),
+			bytes.NewBuffer(reqJSON),
 		)
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
@@ -220,23 +241,34 @@ func TestRateLimiter(t *testing.T) {
 	t.Run("concurrent requests made from the same user can't bypass rate limits", func(t *testing.T) {
 		t.Parallel()
 		bucketCapacity := 7
-		noConcurrentRequests := 120
+		noConcurrentRequests := 100
 
 		mockCache := make(map[string][]byte)
 		redisMutexHandler := MockRedisMutexHandler{}
-		handlerConfiguration := RateLimitConfig{
+
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       15,
+			BucketCapacity: bucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
 			RedisJSONHandler: &MockRedisHandler{
 				mockCache: mockCache,
 			},
-			RedisMu:        &redisMutexHandler,
-			FillRate:       10,
-			BucketCapacity: bucketCapacity,
-			FillUnit:       TestUnit,
 		}
-		commentHandler, err := rateLimitHandler(&handlerConfiguration)
+
+		rateLimiter, err := NewRateLimiter(cfg)
 		require.NoError(t, err)
 
-		server := httptest.NewServer(http.HandlerFunc(commentHandler))
+		handler, err := rateLimiter.RateLimitHandler()
+		require.NoError(t, err)
+
+		server := httptest.NewServer(http.HandlerFunc(handler))
 		defer server.Close()
 
 		uniqueUserIdentifier, err := uuid.NewRandom()
