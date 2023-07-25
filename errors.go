@@ -1,4 +1,4 @@
-package main
+package ratelimiter
 
 const (
 	UnableToProcess   = "unable to process request, please try again"

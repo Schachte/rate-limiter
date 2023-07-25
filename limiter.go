@@ -1,4 +1,4 @@
-package main
+package ratelimiter
 
 import (
 	"context"
@@ -19,6 +19,10 @@ import (
 type RedisStore interface {
 	JSONGet(key, path string, opts ...rjs.GetOption) (res interface{}, err error)
 	JSONSet(key string, path string, obj interface{}, opts ...rjs.SetOption) (res interface{}, err error)
+}
+
+type Request struct {
+	UserIdentifier string `json:"UserIdentifier"`
 }
 
 const (

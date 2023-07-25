@@ -14,6 +14,10 @@ jobs:
       with:
         go-version: 1.19
     - name: Build
-      run: go build -v ./...
+      run: make build
     - name: Test
-      run: go test -v ./...
+      run: make test
+    - name: Clean
+      run: make clean
+    - name: Wipe Cache
+      run: make wipe-cache

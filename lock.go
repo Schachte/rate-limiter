@@ -1,4 +1,4 @@
-package main
+package ratelimiter
 
 import "github.com/go-redsync/redsync/v4"
 

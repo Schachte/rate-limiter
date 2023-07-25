@@ -47,8 +47,34 @@ if err != nil {
 }
 ```
 
+# Development
 
-## Supported:
+See above example for usage. 
+
+- `NewRateLimiter` can use the algorithm as a standard, importable library function
+- `StartServer` will execute an HTTP server for proxy usage to be used as a sidecar or self-hosted service
+
+## Build
+```sh
+make build
+```
+
+## Tests
+```sh
+# run test suite
+make test
+
+# remove test cache
+make wipe-cache 
+```
+
+## Clean
+```sh
+make clean
+```
+
+
+# Supported:
 
 - [Redlock](https://redis.com/glossary/redlock/) for distributed locking
 - [Redis](https://redis.io/) for optimized caching
@@ -56,6 +82,6 @@ if err != nil {
 - Easy to use library
 - Optional web proxy for sidecar usage
 
-## Roadmap
+# Roadmap
 
 [Planning/Roadmap](https://github.com/users/Schachte/projects/4)

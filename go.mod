@@ -1,4 +1,4 @@
-module github.com/schachte/rate_limiting
+module github.com/schachte/rate-limiter
 
 go 1.19
 
