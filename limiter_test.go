@@ -22,7 +22,7 @@ import (
 
 const (
 	TestBucketCapacity = 1
-	TestFillRate       = 2
+	TestFillRate       = 5
 	TestUnit           = time.Second
 )
 
@@ -152,6 +152,114 @@ func TestRateLimiter(t *testing.T) {
 			resp.StatusCode,
 			"status codes should match as StatusOK when rate limit not exceeded",
 		)
+	})
+
+	t.Run("100 RPS should properly rate limit to the configured capacity", func(t *testing.T) {
+		t.Parallel()
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{}
+		// 1 token per second
+		currentFillRate := 1
+		// 100 token volume
+		currentCapacity := 100
+		noConcurrentRequests := 100
+		// cooldown before second batch of reqs
+		coolDownPeriod := 10
+
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       time.Duration(currentFillRate),
+			BucketCapacity: currentCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache: mockCache,
+			},
+		}
+
+		rateLimiter, err := NewRateLimiter(cfg)
+		require.NoError(t, err)
+
+		handler, err := rateLimiter.RateLimitHandler()
+		require.NoError(t, err)
+
+		server := httptest.NewServer(http.HandlerFunc(handler))
+		defer server.Close()
+
+		uniqueUserIdentifier, err := uuid.NewRandom()
+		require.NoError(t, err)
+
+		newReq := Request{
+			UserIdentifier: uniqueUserIdentifier.String(),
+		}
+
+		reqJSON, err := json.Marshal(newReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// store all the requests we want to invoke concurrently
+		var wg sync.WaitGroup
+		requestList := []*http.Request{}
+		userIdentifier := uuid.NewString()
+		for i := 0; i < noConcurrentRequests*2; i++ {
+			req, err := http.NewRequest(
+				http.MethodPost,
+				fmt.Sprintf("%s/%s", server.URL, "limiter"),
+				bytes.NewBuffer(reqJSON),
+			)
+			req.Header.Set("User-Identifier", userIdentifier)
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", "application/json")
+			requestList = append(requestList, req)
+		}
+
+		statusCodeAggregator := make(chan int, noConcurrentRequests*2)
+		requestInvoker := func(req *http.Request, wg *sync.WaitGroup, statusCodeChan chan int) {
+			defer wg.Done()
+			resp, err := server.Client().Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			statusCodeAggregator <- resp.StatusCode
+		}
+
+		// invoke N no. of concurrent requests
+		for i := 0; i < len(requestList)/2; i++ {
+			wg.Add(1)
+			go requestInvoker(requestList[i], &wg, statusCodeAggregator)
+		}
+		wg.Wait()
+
+		time.Sleep(time.Duration(coolDownPeriod) * time.Second)
+
+		// invoke an additional N no. of concurrent requests
+		for i := len(requestList) / 2; i < len(requestList); i++ {
+			wg.Add(1)
+			go requestInvoker(requestList[i], &wg, statusCodeAggregator)
+		}
+
+		// wait for all concurrent requests to complete
+		wg.Wait()
+		close(statusCodeAggregator)
+		successfullyProcessed := 0
+		unsuccessfullyProcessed := 0
+		for req := range statusCodeAggregator {
+			if req == http.StatusOK {
+				successfullyProcessed++
+				continue
+			}
+			if req == http.StatusTooManyRequests {
+				unsuccessfullyProcessed++
+			}
+		}
+
+		require.Equal(t, currentCapacity+coolDownPeriod, successfullyProcessed)
+		require.Equal(t, ((noConcurrentRequests * 2) - (currentCapacity + coolDownPeriod)), unsuccessfullyProcessed)
 	})
 
 	t.Run("rate limits apply and reject when token bucket is empty", func(t *testing.T) {
@@ -340,7 +448,7 @@ func TestRateLimiter(t *testing.T) {
 		require.Equal(t, bucketCapacity, successfullyProcessed)
 	})
 
-	t.Run("missing User-Identifier on web proxy fails requeset", func(t *testing.T) {
+	t.Run("missing User-Identifier on web proxy fails request", func(t *testing.T) {
 		t.Parallel()
 		mockCache := make(map[string][]byte)
 		redisMutexHandler := MockRedisMutexHandler{}
