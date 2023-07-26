@@ -8,7 +8,7 @@ build:
 
 test:
 	@echo "\n\n\nRunning test suite\n------------------------\n\n"
-	$(GOTEST) -v ./...
+	$(GOTEST) -v -coverprofile=coverage.out ./...
 
 clean:
 	$(GOCLEAN)

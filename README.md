@@ -3,29 +3,11 @@
 ![Test Suite](https://github.com/schachte/rate-limiter/actions/workflows/run_go_tests.yml/badge.svg)
 
 
-Simple and scalable rate limiter that leverages the token bucket algorithm, written in Go. 
+Simple and scalable rate limiter that leverages the token bucket algorithm. Useful as a sidecar proxy or direct integration into your application. See usage below. 
 
 # Usage
 
 ```go
-// Redis connection host and port
-connection := "localhost:6379"
-
-// Obtain a Redis client
-client := goredislib.NewClient(&goredislib.Options{
-	Addr: connection,
-})
-
-// Obtain Redlock implementation for distributed locking
-redSync := GetRedSyncInstance(client)
-redisMtxHandler := RedisMutexHandler{
-    redSync: redSync,
-}
-
-// Setup the JSON handler
-rh := rejson.NewReJSONHandler()
-rh.SetGoRedisClientWithContext(context.Background(), client)
-
 // Define parameters for Redis connection and token bucket
 // parameters
 cfg := RateLimitConfig{
@@ -48,8 +30,16 @@ if err != nil {
     log.Fatalf("unable to initialize rate limiter %v", err)
 }
 
+err := rateLimiter.EvaluateRequest(Request{
+    UserIdentifier: "uniqueUserID",
+})
+
+if err.(Error).Message == RateLimitExceeded {
+    // handle rate limiting logic
+}
+
 // Or extend usage by initializing a sidecar proxy for all your
-// applications
+// applications: (http://localhost:8080/limiter)
 err = rateLimiter.StartServer()
 if err != nil {
     log.Fatalf("unable to start rate limiting server %v", err)
