@@ -8,24 +8,6 @@ Simple and scalable rate limiter that leverages the token bucket algorithm, writ
 # Usage
 
 ```go
-// Redis connection host and port
-connection := "localhost:6379"
-
-// Obtain a Redis client
-client := goredislib.NewClient(&goredislib.Options{
-	Addr: connection,
-})
-
-// Obtain Redlock implementation for distributed locking
-redSync := GetRedSyncInstance(client)
-redisMtxHandler := RedisMutexHandler{
-    redSync: redSync,
-}
-
-// Setup the JSON handler
-rh := rejson.NewReJSONHandler()
-rh.SetGoRedisClientWithContext(context.Background(), client)
-
 // Define parameters for Redis connection and token bucket
 // parameters
 cfg := RateLimitConfig{

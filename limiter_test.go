@@ -18,6 +18,7 @@ import (
 	"github.com/nitishm/go-rejson/v4/rjs"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 const (
@@ -29,11 +30,26 @@ const (
 type MockRedisHandler struct {
 	mu        sync.Mutex
 	mockCache map[string][]byte
+
+	shouldFailOnGet bool
+	shouldFailOnSet bool
+
+	shouldFailOnSetInvocation int
+	shouldFailOnGetInvocation int
+
+	getInvocationCount int
+	setInvocationCount int
+
+	shouldSetInvalidBytes bool
 }
 
 func (m *MockRedisHandler) JSONGet(key, path string, opts ...rjs.GetOption) (res interface{}, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.shouldFailOnGet && m.shouldFailOnGetInvocation == m.getInvocationCount {
+		return nil, NewUnableToGetJSONKey().WithError(errors.New("can't get key"))
+	}
+	m.getInvocationCount++
 	data, exists := m.mockCache[key]
 	// simulate missing key
 	if !exists {
@@ -45,6 +61,17 @@ func (m *MockRedisHandler) JSONGet(key, path string, opts ...rjs.GetOption) (res
 func (m *MockRedisHandler) JSONSet(key string, path string, obj interface{}, opts ...rjs.SetOption) (res interface{}, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.shouldFailOnSet && m.shouldFailOnSetInvocation == m.setInvocationCount {
+		return nil, NewUnableToSetJSONKey().WithError(errors.New("can't set key"))
+	}
+	m.setInvocationCount++
+
+	// simulate bad data to mock deserialization failure
+	if m.shouldSetInvalidBytes {
+		m.mockCache[key] = []byte{}
+		return "OK", nil
+	}
+
 	jsonData, err := json.Marshal(obj)
 	if err != nil {
 		return nil, nil
@@ -54,7 +81,9 @@ func (m *MockRedisHandler) JSONSet(key string, path string, obj interface{}, opt
 }
 
 type MockRedisMutexHandler struct {
-	mu sync.Mutex
+	mu                    sync.Mutex
+	acquisitionShouldFail bool
+	releaseShouldFail     bool
 }
 
 type MockRedisMutexLock struct {
@@ -64,9 +93,16 @@ type MockRedisMutexLock struct {
 }
 
 func (m *MockRedisMutexHandler) NewMutex(name string, options ...redsync.Option) MutexLock {
-	return &MockRedisMutexLock{
+	lock := &MockRedisMutexLock{
 		mu: &m.mu,
 	}
+	if m.acquisitionShouldFail {
+		lock.acquisitionShouldFail = m.acquisitionShouldFail
+	}
+	if m.releaseShouldFail {
+		lock.releaseShouldFail = m.releaseShouldFail
+	}
+	return lock
 }
 
 func (m *MockRedisMutexLock) Lock() error {
@@ -90,6 +126,11 @@ func TestRateLimiter(t *testing.T) {
 	// shouldn't be an issue and will improve overall build time of our
 	// program.
 	t.Parallel()
+	logger, err := zap.NewProduction()
+	if err != nil {
+		require.NoError(t, err)
+	}
+	defer logger.Sync()
 
 	t.Run("happy path new user is registered and comment is added", func(t *testing.T) {
 		t.Parallel()
@@ -111,9 +152,10 @@ func TestRateLimiter(t *testing.T) {
 				mockCache: mockCache,
 			},
 		}
-
-		rateLimiter, err := NewRateLimiter(cfg)
-		require.NoError(t, err)
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
 
 		handler, err := rateLimiter.RateLimitHandler()
 		require.NoError(t, err)
@@ -154,6 +196,265 @@ func TestRateLimiter(t *testing.T) {
 		)
 	})
 
+	t.Run("internal cache failure propagates error to client", func(t *testing.T) {
+		t.Parallel()
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{
+			acquisitionShouldFail: true,
+		}
+
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       TestFillRate,
+			BucketCapacity: TestBucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache: mockCache,
+			},
+		}
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
+
+		handler, err := rateLimiter.RateLimitHandler()
+		require.NoError(t, err)
+
+		server := httptest.NewServer(http.HandlerFunc(handler))
+		defer server.Close()
+
+		uniqueUserIdentifier, err := uuid.NewRandom()
+		require.NoError(t, err)
+
+		newReq := Request{
+			UserIdentifier: uniqueUserIdentifier.String(),
+		}
+
+		commentJSON, err := json.Marshal(newReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req, err := http.NewRequest(
+			http.MethodPost,
+			fmt.Sprintf("%s/%s", server.URL, "limiter"),
+			bytes.NewBuffer(commentJSON),
+		)
+		req.Header.Set("User-Identifier", uniqueUserIdentifier.String())
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := server.Client().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(
+			t,
+			http.StatusInternalServerError,
+			resp.StatusCode,
+		)
+	})
+
+	t.Run("non-POST req fails against HTTP server", func(t *testing.T) {
+		t.Parallel()
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{}
+
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       TestFillRate,
+			BucketCapacity: TestBucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache: mockCache,
+			},
+		}
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
+
+		handler, err := rateLimiter.RateLimitHandler()
+		require.NoError(t, err)
+
+		server := httptest.NewServer(http.HandlerFunc(handler))
+		defer server.Close()
+
+		req, err := http.NewRequest(
+			http.MethodGet,
+			fmt.Sprintf("%s/%s", server.URL, "limiter"),
+			bytes.NewBuffer([]byte{}),
+		)
+		req.Header.Set("User-Identifier", uuid.NewString())
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := server.Client().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(
+			t,
+			http.StatusMethodNotAllowed,
+			resp.StatusCode,
+		)
+	})
+
+	t.Run("initial request deserialization fails", func(t *testing.T) {
+		t.Parallel()
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{}
+
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       TestFillRate,
+			BucketCapacity: TestBucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache: mockCache,
+			},
+		}
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
+
+		handler, err := rateLimiter.RateLimitHandler()
+		require.NoError(t, err)
+
+		server := httptest.NewServer(http.HandlerFunc(handler))
+		defer server.Close()
+
+		req, err := http.NewRequest(
+			http.MethodPost,
+			fmt.Sprintf("%s/%s", server.URL, "limiter"),
+			bytes.NewBuffer([]byte{}),
+		)
+		req.Header.Set("User-Identifier", uuid.NewString())
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := server.Client().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(
+			t,
+			http.StatusBadRequest,
+			resp.StatusCode,
+		)
+	})
+
+	t.Run("excess tokens exceeding bucket capacity overflow and don't persist", func(t *testing.T) {
+		t.Parallel()
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{}
+
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			// add a new token every second with a capacity of 1
+			FillRate:       1,
+			BucketCapacity: 1,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache: mockCache,
+			},
+		}
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
+
+		handler, err := rateLimiter.RateLimitHandler()
+		require.NoError(t, err)
+
+		server := httptest.NewServer(http.HandlerFunc(handler))
+		defer server.Close()
+
+		uniqueUserIdentifier, err := uuid.NewRandom()
+		require.NoError(t, err)
+
+		newReq := Request{
+			UserIdentifier: uniqueUserIdentifier.String(),
+		}
+
+		commentJSON, err := json.Marshal(newReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req, err := http.NewRequest(
+			http.MethodPost,
+			fmt.Sprintf("%s/%s", server.URL, "limiter"),
+			bytes.NewBuffer(commentJSON),
+		)
+		req.Header.Set("User-Identifier", newReq.UserIdentifier)
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := server.Client().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(
+			t,
+			http.StatusOK,
+			resp.StatusCode,
+			"status codes should match as StatusOK when rate limit not exceeded",
+		)
+
+		// wait for tokens to fill up and exceed capacity (5 seconds = 5 tokens)
+		time.Sleep(5 * time.Second)
+
+		req, err = http.NewRequest(
+			http.MethodPost,
+			fmt.Sprintf("%s/%s", server.URL, "limiter"),
+			bytes.NewBuffer(commentJSON),
+		)
+		req.Header.Set("User-Identifier", newReq.UserIdentifier)
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err = server.Client().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(
+			t,
+			http.StatusOK,
+			resp.StatusCode,
+			"status codes should match as StatusOK when rate limit not exceeded",
+		)
+		addedUser := &Bucket{}
+		err = json.Unmarshal(mockCache[newReq.UserIdentifier], addedUser)
+		require.NoError(t, err)
+		require.LessOrEqual(t, addedUser.Capacity, cfg.BucketCapacity)
+	})
+
 	t.Run("100 RPS should properly rate limit to the configured capacity", func(t *testing.T) {
 		t.Parallel()
 		mockCache := make(map[string][]byte)
@@ -182,8 +483,10 @@ func TestRateLimiter(t *testing.T) {
 			},
 		}
 
-		rateLimiter, err := NewRateLimiter(cfg)
-		require.NoError(t, err)
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
 
 		handler, err := rateLimiter.RateLimitHandler()
 		require.NoError(t, err)
@@ -283,8 +586,10 @@ func TestRateLimiter(t *testing.T) {
 			},
 		}
 
-		rateLimiter, err := NewRateLimiter(cfg)
-		require.NoError(t, err)
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
 
 		handler, err := rateLimiter.RateLimitHandler()
 		require.NoError(t, err)
@@ -310,7 +615,7 @@ func TestRateLimiter(t *testing.T) {
 			bytes.NewBuffer(reqJSON),
 		)
 		require.NoError(t, err)
-		req.Header.Set("User-Identifier", uuid.NewString())
+		req.Header.Set("User-Identifier", newReq.UserIdentifier)
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := server.Client().Do(req)
@@ -331,7 +636,7 @@ func TestRateLimiter(t *testing.T) {
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
 			bytes.NewBuffer(reqJSON),
 		)
-		req.Header.Set("User-Identifier", uuid.NewString())
+		req.Header.Set("User-Identifier", newReq.UserIdentifier)
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err = server.Client().Do(req)
@@ -351,7 +656,7 @@ func TestRateLimiter(t *testing.T) {
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
 			bytes.NewBuffer(reqJSON),
 		)
-		req.Header.Set("User-Identifier", uuid.NewString())
+		req.Header.Set("User-Identifier", newReq.UserIdentifier)
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err = server.Client().Do(req)
@@ -384,8 +689,10 @@ func TestRateLimiter(t *testing.T) {
 			},
 		}
 
-		rateLimiter, err := NewRateLimiter(cfg)
-		require.NoError(t, err)
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
 
 		handler, err := rateLimiter.RateLimitHandler()
 		require.NoError(t, err)
@@ -469,8 +776,10 @@ func TestRateLimiter(t *testing.T) {
 			},
 		}
 
-		rateLimiter, err := NewRateLimiter(cfg)
-		require.NoError(t, err)
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
 
 		handler, err := rateLimiter.RateLimitHandler()
 		require.NoError(t, err)
@@ -511,6 +820,11 @@ func TestRateLimiter(t *testing.T) {
 
 func TestRequestEvaluator(t *testing.T) {
 	t.Parallel()
+	logger, err := zap.NewProduction()
+	if err != nil {
+		require.NoError(t, err)
+	}
+	defer logger.Sync()
 
 	mockCache := make(map[string][]byte)
 	redisMutexHandler := MockRedisMutexHandler{}
@@ -533,19 +847,10 @@ func TestRequestEvaluator(t *testing.T) {
 	t.Run("fails when user identifier is missing", func(t *testing.T) {
 		t.Parallel()
 
-		rateLimiter, err := NewRateLimiter(cfg)
-		require.NoError(t, err)
-
-		err = rateLimiter.EvaluateRequest(Request{})
-		require.Error(t, err, MissingIdentifierHeader)
-	})
-
-	t.Run("fails when user identifier is missing", func(t *testing.T) {
-		t.Parallel()
-
-		rateLimiter, err := NewRateLimiter(cfg)
-		require.NoError(t, err)
-
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
 		err = rateLimiter.EvaluateRequest(Request{})
 		require.Error(t, err, MissingIdentifierHeader)
 	})
@@ -553,10 +858,182 @@ func TestRequestEvaluator(t *testing.T) {
 	t.Run("fails when lock can't be acquired", func(t *testing.T) {
 		t.Parallel()
 
-		rateLimiter, err := NewRateLimiter(cfg)
-		require.NoError(t, err)
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{
+			acquisitionShouldFail: true,
+		}
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
 
-		err = rateLimiter.EvaluateRequest(Request{})
-		require.Error(t, err, MissingIdentifierHeader)
+			FillRate:       TestFillRate,
+			BucketCapacity: TestBucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache: mockCache,
+			},
+		}
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
+		err = rateLimiter.EvaluateRequest(Request{UserIdentifier: "test-user"})
+		require.Error(t, err, UnableToAcquireLock)
+	})
+
+	t.Run("fails when lock can't be released", func(t *testing.T) {
+		t.Parallel()
+
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{
+			releaseShouldFail: true,
+		}
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       TestFillRate,
+			BucketCapacity: TestBucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache: mockCache,
+			},
+		}
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
+		err = rateLimiter.EvaluateRequest(Request{UserIdentifier: "test-user"})
+		require.Error(t, err, UnableToReleaseLock)
+	})
+
+	t.Run("fails when JSON key can't set", func(t *testing.T) {
+		t.Parallel()
+
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{}
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       TestFillRate,
+			BucketCapacity: TestBucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache:       mockCache,
+				shouldFailOnSet: true,
+			},
+		}
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
+		err = rateLimiter.EvaluateRequest(Request{UserIdentifier: "test-user"})
+		require.Error(t, err, UnableToSetJSONKey)
+	})
+
+	t.Run("fails when JSON key can't set final update", func(t *testing.T) {
+		t.Parallel()
+
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{}
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       TestFillRate,
+			BucketCapacity: TestBucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache:                 mockCache,
+				shouldFailOnSet:           true,
+				shouldFailOnSetInvocation: 1,
+			},
+		}
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
+		err = rateLimiter.EvaluateRequest(Request{UserIdentifier: "test-user"})
+		require.Error(t, err, UnableToSetJSONKey)
+	})
+
+	t.Run("fails when JSON key can't get", func(t *testing.T) {
+		t.Parallel()
+
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{}
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       TestFillRate,
+			BucketCapacity: TestBucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache:       mockCache,
+				shouldFailOnGet: true,
+			},
+		}
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
+		err = rateLimiter.EvaluateRequest(Request{UserIdentifier: "test-user"})
+		require.Error(t, err, UnableToGetJSONKey)
+	})
+
+	t.Run("fails when JSON value can't get be deserialized from Redis", func(t *testing.T) {
+		t.Parallel()
+
+		mockCache := make(map[string][]byte)
+		redisMutexHandler := MockRedisMutexHandler{}
+		cfg := RateLimitConfig{
+			RedisHostname: "localhost",
+			RedisPort:     6379,
+			ServerHost:    "0.0.0.0",
+			ServerPort:    8080,
+
+			FillRate:       TestFillRate,
+			BucketCapacity: TestBucketCapacity,
+			FillUnit:       TestUnit,
+
+			RedisMu: &redisMutexHandler,
+			RedisJSONHandler: &MockRedisHandler{
+				mockCache:             mockCache,
+				shouldSetInvalidBytes: true,
+			},
+		}
+		rateLimiter := RateLimiter{
+			cfg,
+			logger,
+		}
+		// First attempt succeeds and persists invalid value into cache
+		err = rateLimiter.EvaluateRequest(Request{UserIdentifier: "test-user"})
+		require.Nil(t, err)
+
+		// Second lookup fails on existing user due to deserialization
+		err = rateLimiter.EvaluateRequest(Request{UserIdentifier: "test-user"})
+		require.Error(t, err, UnableToDeserialize)
 	})
 }

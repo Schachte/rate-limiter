@@ -1,6 +1,7 @@
 package ratelimiter
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"github.com/go-redsync/redsync/v4"
 	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	"github.com/gomodule/redigo/redis"
+	"github.com/nitishm/go-rejson/v4"
 	"github.com/nitishm/go-rejson/v4/rjs"
 	goredislib "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
@@ -76,15 +78,22 @@ type Bucket struct {
 // token limits for the user have been exceeded
 func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 	if incomingReq.UserIdentifier == "" {
+		r.logger.Debug("request made with no user identifier")
 		return NewUserIdentifierMissing()
 	}
 	mtx := r.cfg.RedisMu.NewMutex(fmt.Sprintf("%s-lock", incomingReq.UserIdentifier))
 	if err := mtx.Lock(); err != nil {
+		r.logger.Error("unable to acquire mutex on user key",
+			zap.String("user", incomingReq.UserIdentifier),
+		)
 		return NewUnableToAcquireLock().WithError(err)
 	}
 	defer func() {
 		// TODO: This return isn't handled properly
 		if ok, err := mtx.Unlock(); !ok || err != nil {
+			r.logger.Error("unable to release mutex on user key",
+				zap.String("user", incomingReq.UserIdentifier),
+			)
 			evalError = NewUnableToReleaseLock().WithError(err)
 		}
 	}()
@@ -93,6 +102,9 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 	jsonData, err := r.cfg.RedisJSONHandler.JSONGet(incomingReq.UserIdentifier, ".")
 	if err != nil {
 		if err != goredislib.Nil {
+			r.logger.Error("unable to handle key retrieval for user",
+				zap.String("user", incomingReq.UserIdentifier),
+			)
 			return NewUnableToGetJSONKey().WithError(err)
 		}
 
@@ -100,34 +112,48 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 		userBucket = &Bucket{
 			UserIdentifier: incomingReq.UserIdentifier,
 			FillRate:       r.cfg.FillRate,
-			Tokens:         0,
 			Unit:           r.cfg.FillUnit,
 			Capacity:       r.cfg.BucketCapacity,
 		}
 
 		_, err = r.cfg.RedisJSONHandler.JSONSet(incomingReq.UserIdentifier, ".", userBucket)
 		if err != nil {
+			r.logger.Error("unable to set JSON entry for user bucket",
+				zap.String("user", incomingReq.UserIdentifier),
+			)
 			return NewUnableToSetJSONKey().WithError(err)
 		}
 	} else {
 		bucketJSON, err := redis.Bytes(jsonData, err)
 		if err != nil {
+			r.logger.Error("unable to deserialize JSON entry for user bucket",
+				zap.String("user", incomingReq.UserIdentifier),
+			)
 			return NewUnableToDeserialize().WithError(err)
 		}
 
 		err = json.Unmarshal(bucketJSON, userBucket)
 		if err != nil {
+			r.logger.Error("unable to deserialize JSON entry for user bucket",
+				zap.String("user", incomingReq.UserIdentifier),
+			)
 			return NewUnableToDeserialize().WithError(err)
 		}
 	}
 
-	_, err = userBucket.verifyAllowance()
+	err = userBucket.verifyAllowance()
 	if err != nil {
+		r.logger.Error("user has exceeded rate limit, request is denied",
+			zap.String("user", incomingReq.UserIdentifier),
+		)
 		return errors.New(RateLimitExceeded)
 	}
 
 	_, err = r.cfg.RedisJSONHandler.JSONSet(incomingReq.UserIdentifier, ".", userBucket)
 	if err != nil {
+		r.logger.Error("unable to set JSON entry for user bucket",
+			zap.String("user", incomingReq.UserIdentifier),
+		)
 		return NewUnableToPersistMetadata().WithError(err)
 	}
 	return nil
@@ -136,7 +162,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 // verifyAllowance will employ the token bucket algorithm which
 // will reference a specific users usage quota to determine if the comment
 // can be added or not.
-func (b *Bucket) verifyAllowance() (time.Time, error) {
+func (b *Bucket) verifyAllowance() error {
 	currentTime := time.Now()
 	timeElapsedSeconds := currentTime.Sub(b.LastChecked).Seconds()
 
@@ -150,9 +176,6 @@ func (b *Bucket) verifyAllowance() (time.Time, error) {
 
 	// update the number of tokens in the bucket
 	b.Tokens += int(newTokens)
-	if b.Tokens > b.Capacity {
-		b.Tokens = b.Capacity
-	}
 
 	// update the last checked time
 	b.LastChecked = currentTime
@@ -162,10 +185,10 @@ func (b *Bucket) verifyAllowance() (time.Time, error) {
 	// the evaluation time.
 	if b.Tokens > 0 {
 		b.Tokens -= 1
-		return currentTime, nil
+		return nil
 	}
 
-	return time.Now(), fmt.Errorf("unable to process comment as last added comment was: %v and current time is: %v",
+	return fmt.Errorf("unable to process comment as last added comment was: %v and current time is: %v",
 		b.LastChecked,
 		currentTime,
 	)
@@ -187,6 +210,35 @@ func NewRateLimiter(config RateLimitConfig) (RateLimiter, error) {
 		panic(err)
 	}
 	defer logger.Sync()
+
+	switch {
+	case config.RedisHostname == "":
+		return RateLimiter{}, errors.New("missing redis hostname")
+	case config.ServerHost == "":
+		return RateLimiter{}, errors.New("missing server hostname")
+	case config.RedisPort <= 0:
+		return RateLimiter{}, errors.New("invalid redis port")
+	case config.ServerPort <= 0:
+		return RateLimiter{}, errors.New("invalid redis port")
+	case config.FillRate <= 0:
+		return RateLimiter{}, errors.New("invalid fill rate")
+	}
+
+	client := goredislib.NewClient(&goredislib.Options{
+		Addr: fmt.Sprintf("%s:%d", config.RedisHostname, config.RedisPort),
+	})
+
+	// Obtain Redlock implementation for distributed locking
+	redSync := GetRedSyncInstance(client)
+	redisMtxHandler := RedisMutexHandler{
+		redSync: redSync,
+	}
+
+	// Setup the JSON handler for persisting bucket statistics
+	rh := rejson.NewReJSONHandler()
+	rh.SetGoRedisClientWithContext(context.Background(), client)
+	config.RedisMu = &redisMtxHandler
+	config.RedisJSONHandler = rh
 	return RateLimiter{
 		config,
 		logger,
@@ -200,6 +252,7 @@ func (l *RateLimiter) RateLimitHandler() (func(w http.ResponseWriter, r *http.Re
 		if r.Method == http.MethodPost {
 			userIdentifier := r.Header.Get("User-Identifier")
 			if userIdentifier == "" {
+				l.logger.Debug("request made with no user identifier")
 				http.Error(w, MissingIdentifierHeader, http.StatusBadRequest)
 				return
 			}
@@ -207,6 +260,7 @@ func (l *RateLimiter) RateLimitHandler() (func(w http.ResponseWriter, r *http.Re
 			var newReq Request
 			err := json.NewDecoder(r.Body).Decode(&newReq)
 			if err != nil {
+				l.logger.Error("failed to deserialize user request")
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -233,11 +287,15 @@ func (l *RateLimiter) RateLimitHandler() (func(w http.ResponseWriter, r *http.Re
 func (r *RateLimiter) StartServer() error {
 	rateLimiter, err := r.RateLimitHandler()
 	if err != nil {
+		r.logger.Error("rate limit handler initialization failed")
 		return errors.New("unable to initialize rate limit handler")
 	}
 
 	http.HandleFunc("/limiter", rateLimiter)
-	fmt.Printf("Running server at %s:%d\n", r.cfg.ServerHost, r.cfg.ServerPort)
+	r.logger.Info("Running server",
+		zap.String("host", r.cfg.ServerHost),
+		zap.Int("port", r.cfg.ServerPort),
+	)
 	return http.ListenAndServe(
 		fmt.Sprintf(
 			"%s:%d",
