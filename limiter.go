@@ -12,6 +12,7 @@ import (
 	"github.com/gomodule/redigo/redis"
 	"github.com/nitishm/go-rejson/v4/rjs"
 	goredislib "github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 )
 
 const (
@@ -51,7 +52,8 @@ type RateLimitConfig struct {
 }
 
 type RateLimiter struct {
-	cfg RateLimitConfig
+	cfg    RateLimitConfig
+	logger *zap.Logger
 }
 
 // Bucket is the abstraction used to rate limit users on a per-user level
@@ -66,6 +68,8 @@ type Bucket struct {
 	Unit time.Duration `json:"Unit"`
 	// lastChecked is the last recorded timestep in which we filled the bucket
 	LastChecked time.Time `json:"LastChecked"`
+	// Capacity is the total capacity of the bucket
+	Capacity int `json:"Capacity"`
 }
 
 // EvaluateRequest will lock the user identifier in Redis and evaluate if the configured
@@ -96,8 +100,9 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 		userBucket = &Bucket{
 			UserIdentifier: incomingReq.UserIdentifier,
 			FillRate:       r.cfg.FillRate,
-			Tokens:         r.cfg.BucketCapacity,
+			Tokens:         0,
 			Unit:           r.cfg.FillUnit,
+			Capacity:       r.cfg.BucketCapacity,
 		}
 
 		_, err = r.cfg.RedisJSONHandler.JSONSet(incomingReq.UserIdentifier, ".", userBucket)
@@ -133,25 +138,30 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 // can be added or not.
 func (b *Bucket) verifyAllowance() (time.Time, error) {
 	currentTime := time.Now()
+	timeElapsedSeconds := currentTime.Sub(b.LastChecked).Seconds()
+
+	// calculate number of tokens to retroactively add into the bucket
+	newTokens := int(timeElapsedSeconds) / int(b.FillRate)
+
+	// avoid exceeding max bucket capacity
+	if newTokens > int(b.Capacity) {
+		newTokens = int(b.Capacity)
+	}
+
+	// update the number of tokens in the bucket
+	b.Tokens += int(newTokens)
+	if b.Tokens > b.Capacity {
+		b.Tokens = b.Capacity
+	}
+
+	// update the last checked time
+	b.LastChecked = currentTime
 
 	// if the number of tokens is non-empty, we know the request is
 	// ok to process. From here, we can drain a token and update
 	// the evaluation time.
 	if b.Tokens > 0 {
-		b.Tokens--
-		b.LastChecked = currentTime
-		return currentTime, nil
-	}
-
-	// threshold calculates a delta between now and whatever our fill rate is in the past
-	// to evaluate if we're able to process the request or not.
-	threshold := currentTime.Add(-1 * b.FillRate * b.Unit)
-
-	// If the current time is 11:00AM and the lastChecked time is 10:59AM
-	// we know that we can only add a token and process the request if
-	// the lastChecked time happened before the threshold
-	if b.LastChecked.Before(threshold) {
-		b.LastChecked = currentTime
+		b.Tokens -= 1
 		return currentTime, nil
 	}
 
@@ -172,9 +182,14 @@ func GetRedSyncInstance(client *goredislib.Client) *redsync.Redsync {
 // or sidecar container. This is a good choice when deploying usage for all applications if you
 // prefer to avoid embedding rate limiting logic directly into your application code.
 func NewRateLimiter(config RateLimitConfig) (RateLimiter, error) {
-	//TODO: Add validation here
+	logger, err := zap.NewProduction()
+	if err != nil {
+		panic(err)
+	}
+	defer logger.Sync()
 	return RateLimiter{
 		config,
+		logger,
 	}, nil
 }
 
