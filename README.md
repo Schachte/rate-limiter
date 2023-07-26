@@ -5,7 +5,13 @@
 
 Simple and scalable rate limiter that leverages the token bucket algorithm. Useful as a sidecar proxy or direct integration into your application. See usage below. 
 
+Rate limiters are useful within an application or API gateway/sidecar proxy to avoid overloading your origin server or for preventing spam and abuse. When too many requests are invoked within a configurable time period, the user will be hit with either `TooManyRequests` error in Go or the equivalent `429 TooManyRequests` HTTP status code if using the web server.
+
+Currently, the only dependency is Redis, which is used as a caching server for the bucket statistics to track per-ID request usage. Additionally, Redsync is used internally which implements the [Redlock](https://redis.com/glossary/redlock/) algorithm for distributed locking to prevent race conditions from happening when calculating token usage.
+
 # Usage
+
+Run Redis environment locally via Docker with: `make run-dev`
 
 ```go
 // Define parameters for Redis connection and token bucket
