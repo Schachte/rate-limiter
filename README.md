@@ -66,6 +66,11 @@ if err != nil {
 return err
 ```
 
+# Docker
+
+You can run the entire development server via Docker by running `make run-dev`. Alternatively, you can run the `docker-compose.yml` file directly and target
+only the rate limiter service if you already have Redis running with `docker-compose up -d limiter`
+
 # Development
 
 See above example for usage. 
