@@ -5,3 +5,11 @@ services:
     restart: always
     ports:
       - '6379:6379'
+  limiter:
+    build: .
+    depends_on:
+      - redis
+    restart: always
+    ports:
+      # Note this must be changed if you modify the server port
+      - '8080:8080'

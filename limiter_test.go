@@ -166,21 +166,12 @@ func TestRateLimiter(t *testing.T) {
 		uniqueUserIdentifier, err := uuid.NewRandom()
 		require.NoError(t, err)
 
-		newReq := Request{
-			UserIdentifier: uniqueUserIdentifier.String(),
-		}
-
-		commentJSON, err := json.Marshal(newReq)
-		if err != nil {
-			t.Fatal(err)
-		}
-
 		req, err := http.NewRequest(
 			http.MethodPost,
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
-			bytes.NewBuffer(commentJSON),
+			nil,
 		)
-		req.Header.Set("User-Identifier", uuid.NewString())
+		req.Header.Set("User-Identifier", uniqueUserIdentifier.String())
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
 
@@ -232,19 +223,10 @@ func TestRateLimiter(t *testing.T) {
 		uniqueUserIdentifier, err := uuid.NewRandom()
 		require.NoError(t, err)
 
-		newReq := Request{
-			UserIdentifier: uniqueUserIdentifier.String(),
-		}
-
-		commentJSON, err := json.Marshal(newReq)
-		if err != nil {
-			t.Fatal(err)
-		}
-
 		req, err := http.NewRequest(
 			http.MethodPost,
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
-			bytes.NewBuffer(commentJSON),
+			nil,
 		)
 		req.Header.Set("User-Identifier", uniqueUserIdentifier.String())
 		require.NoError(t, err)
@@ -312,57 +294,6 @@ func TestRateLimiter(t *testing.T) {
 		)
 	})
 
-	t.Run("initial request deserialization fails", func(t *testing.T) {
-		t.Parallel()
-		mockCache := make(map[string][]byte)
-		redisMutexHandler := MockRedisMutexHandler{}
-
-		cfg := RateLimitConfig{
-			RedisHostname: "localhost",
-			RedisPort:     6379,
-			ServerHost:    "0.0.0.0",
-			ServerPort:    8080,
-
-			FillRate:       TestFillRate,
-			BucketCapacity: TestBucketCapacity,
-			FillUnit:       TestUnit,
-
-			RedisMu: &redisMutexHandler,
-			RedisJSONHandler: &MockRedisHandler{
-				mockCache: mockCache,
-			},
-		}
-		rateLimiter := RateLimiter{
-			cfg,
-			logger,
-		}
-
-		handler, err := rateLimiter.RateLimitHandler()
-		require.NoError(t, err)
-
-		server := httptest.NewServer(http.HandlerFunc(handler))
-		defer server.Close()
-
-		req, err := http.NewRequest(
-			http.MethodPost,
-			fmt.Sprintf("%s/%s", server.URL, "limiter"),
-			bytes.NewBuffer([]byte{}),
-		)
-		req.Header.Set("User-Identifier", uuid.NewString())
-		require.NoError(t, err)
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := server.Client().Do(req)
-		require.NoError(t, err)
-		defer resp.Body.Close()
-
-		require.Equal(
-			t,
-			http.StatusBadRequest,
-			resp.StatusCode,
-		)
-	})
-
 	t.Run("excess tokens exceeding bucket capacity overflow and don't persist", func(t *testing.T) {
 		t.Parallel()
 		mockCache := make(map[string][]byte)
@@ -402,15 +333,10 @@ func TestRateLimiter(t *testing.T) {
 			UserIdentifier: uniqueUserIdentifier.String(),
 		}
 
-		commentJSON, err := json.Marshal(newReq)
-		if err != nil {
-			t.Fatal(err)
-		}
-
 		req, err := http.NewRequest(
 			http.MethodPost,
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
-			bytes.NewBuffer(commentJSON),
+			nil,
 		)
 		req.Header.Set("User-Identifier", newReq.UserIdentifier)
 		require.NoError(t, err)
@@ -433,7 +359,7 @@ func TestRateLimiter(t *testing.T) {
 		req, err = http.NewRequest(
 			http.MethodPost,
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
-			bytes.NewBuffer(commentJSON),
+			nil,
 		)
 		req.Header.Set("User-Identifier", newReq.UserIdentifier)
 		require.NoError(t, err)
@@ -787,22 +713,10 @@ func TestRateLimiter(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(handler))
 		defer server.Close()
 
-		uniqueUserIdentifier, err := uuid.NewRandom()
-		require.NoError(t, err)
-
-		newReq := Request{
-			UserIdentifier: uniqueUserIdentifier.String(),
-		}
-
-		reqJSON, err := json.Marshal(newReq)
-		if err != nil {
-			t.Fatal(err)
-		}
-
 		req, err := http.NewRequest(
 			http.MethodPost,
 			fmt.Sprintf("%s/%s", server.URL, "limiter"),
-			bytes.NewBuffer(reqJSON),
+			nil,
 		)
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")

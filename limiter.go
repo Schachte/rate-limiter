@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/go-redsync/redsync/v4"
@@ -15,6 +16,7 @@ import (
 	"github.com/nitishm/go-rejson/v4/rjs"
 	goredislib "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 const (
@@ -35,7 +37,7 @@ type RedisStore interface {
 // Request contains information required to uniquely identify a request. This
 // is typically pulled from the User-Identifier HTTP header for the sidecar proxy
 type Request struct {
-	UserIdentifier string `json:"UserIdentifier"`
+	UserIdentifier string `json:"User-Identifier"`
 }
 
 // RateLimitConfig contains all the information used to dynamically
@@ -61,7 +63,7 @@ type RateLimiter struct {
 // Bucket is the abstraction used to rate limit users on a per-user level
 type Bucket struct {
 	// userIdentifier is the unique identification value used to track usage on a per-customer basis
-	UserIdentifier string `json:"UserIdentifier"`
+	UserIdentifier string `json:"User-Identifier"`
 	// tokens is the capacity of a given bucket (number of tokens it's capable of holding)
 	Tokens int `json:"Tokens"`
 	// fillRate is the fixed rate in which we add tokens to the bucket unless or until it's at capacity
@@ -85,6 +87,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 	if err := mtx.Lock(); err != nil {
 		r.logger.Error("unable to acquire mutex on user key",
 			zap.String("user", incomingReq.UserIdentifier),
+			zap.Error(err),
 		)
 		return NewUnableToAcquireLock().WithError(err)
 	}
@@ -93,6 +96,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 		if ok, err := mtx.Unlock(); !ok || err != nil {
 			r.logger.Error("unable to release mutex on user key",
 				zap.String("user", incomingReq.UserIdentifier),
+				zap.Error(err),
 			)
 			evalError = NewUnableToReleaseLock().WithError(err)
 		}
@@ -104,6 +108,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 		if err != goredislib.Nil {
 			r.logger.Error("unable to handle key retrieval for user",
 				zap.String("user", incomingReq.UserIdentifier),
+				zap.Error(err),
 			)
 			return NewUnableToGetJSONKey().WithError(err)
 		}
@@ -120,6 +125,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 		if err != nil {
 			r.logger.Error("unable to set JSON entry for user bucket",
 				zap.String("user", incomingReq.UserIdentifier),
+				zap.Error(err),
 			)
 			return NewUnableToSetJSONKey().WithError(err)
 		}
@@ -128,6 +134,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 		if err != nil {
 			r.logger.Error("unable to deserialize JSON entry for user bucket",
 				zap.String("user", incomingReq.UserIdentifier),
+				zap.Error(err),
 			)
 			return NewUnableToDeserialize().WithError(err)
 		}
@@ -136,6 +143,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 		if err != nil {
 			r.logger.Error("unable to deserialize JSON entry for user bucket",
 				zap.String("user", incomingReq.UserIdentifier),
+				zap.Error(err),
 			)
 			return NewUnableToDeserialize().WithError(err)
 		}
@@ -145,6 +153,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 	if err != nil {
 		r.logger.Error("user has exceeded rate limit, request is denied",
 			zap.String("user", incomingReq.UserIdentifier),
+			zap.Error(err),
 		)
 		return errors.New(RateLimitExceeded)
 	}
@@ -153,6 +162,7 @@ func (r *RateLimiter) EvaluateRequest(incomingReq Request) (evalError error) {
 	if err != nil {
 		r.logger.Error("unable to set JSON entry for user bucket",
 			zap.String("user", incomingReq.UserIdentifier),
+			zap.Error(err),
 		)
 		return NewUnableToPersistMetadata().WithError(err)
 	}
@@ -205,10 +215,33 @@ func GetRedSyncInstance(client *goredislib.Client) *redsync.Redsync {
 // or sidecar container. This is a good choice when deploying usage for all applications if you
 // prefer to avoid embedding rate limiting logic directly into your application code.
 func NewRateLimiter(config RateLimitConfig) (RateLimiter, error) {
-	logger, err := zap.NewProduction()
-	if err != nil {
-		panic(err)
+	// logger, err := zap.NewProduction()
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// defer logger.Sync()
+
+	encoderConfig := zapcore.EncoderConfig{
+		TimeKey:        "time",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		CallerKey:      "caller",
+		MessageKey:     "msg",
+		StacktraceKey:  "error",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.LowercaseLevelEncoder,
+		EncodeTime:     zapcore.ISO8601TimeEncoder,
+		EncodeDuration: zapcore.StringDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
+
+	core := zapcore.NewCore(
+		zapcore.NewJSONEncoder(encoderConfig),
+		zapcore.AddSync(os.Stdout),
+		zap.InfoLevel,
+	)
+
+	logger := zap.New(core)
 	defer logger.Sync()
 
 	switch {
@@ -239,6 +272,13 @@ func NewRateLimiter(config RateLimitConfig) (RateLimiter, error) {
 	rh.SetGoRedisClientWithContext(context.Background(), client)
 	config.RedisMu = &redisMtxHandler
 	config.RedisJSONHandler = rh
+
+	logger.Info(fmt.Sprintf("The rate limiter has been initialized successfully on %s:%d", config.ServerHost, config.ServerPort),
+		zap.Int("refill_rate", int(config.FillRate)),
+		zap.Int("bucket_capacity", int(config.BucketCapacity)),
+		zap.Any("time_unit", config.FillUnit.String()),
+	)
+
 	return RateLimiter{
 		config,
 		logger,
@@ -257,16 +297,12 @@ func (l *RateLimiter) RateLimitHandler() (func(w http.ResponseWriter, r *http.Re
 				return
 			}
 
-			var newReq Request
-			err := json.NewDecoder(r.Body).Decode(&newReq)
-			if err != nil {
-				l.logger.Error("failed to deserialize user request")
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
+			newReq := Request{
+				UserIdentifier: userIdentifier,
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			err = l.EvaluateRequest(newReq)
+			err := l.EvaluateRequest(newReq)
 			if err != nil {
 				if err.Error() == RateLimitExceeded {
 					w.WriteHeader(http.StatusTooManyRequests)

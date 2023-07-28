@@ -11,45 +11,59 @@ Currently, the only dependency is Redis, which is used as a caching server for t
 
 # Usage
 
-Run Redis environment locally via Docker with: `make run-dev`
+```
+Options:
+  -bucket-capacity int
+        Bucket capacity (default 1)
+  -fill-rate float
+        Fill rate (default 30)
+  -fill-unit duration
+        Fill unit (default 1s)
+  -help
+        Display help
+  -redis-hostname string
+        Redis hostname (default "redis")
+  -redis-port int
+        Redis port (default 6379)
+  -server-host string
+        Server host (default "0.0.0.0")
+  -server-port int
+        Server port (default 8080)
+```
+
+Run local environment locally via Docker with: `make run-dev`
+
+You can view examples in the [cli](/cli) directory.
 
 ```go
+limiter "github.com/schachte/rate-limiter"
+
 // Define parameters for Redis connection and token bucket
 // parameters
-cfg := RateLimitConfig{
+cfg := limiter.RateLimitConfig{
     RedisHostname: "localhost",
     RedisPort:     6379,
     ServerHost:    "0.0.0.0",
-    ServerPort:    8080,
+    ServerPort:    9080,
 
-    FillRate:       StandardFillRate,
-    BucketCapacity: StandardBucketCapacity,
-    FillUnit:       StandardUnit,
-
-    RedisMu:          &redisMtxHandler,
-    RedisJSONHandler: redisJsonHandler,
+    FillRate:       limiter.StandardFillRate,
+    BucketCapacity: limiter.StandardBucketCapacity,
+    FillUnit:       limiter.StandardUnit,
 }
 
 // Use as a standalone library function
-rateLimiter, err := NewRateLimiter(cfg)
+rateLimiter, err := limiter.NewRateLimiter(cfg)
 if err != nil {
     log.Fatalf("unable to initialize rate limiter %v", err)
-}
-
-err := rateLimiter.EvaluateRequest(Request{
-    UserIdentifier: "uniqueUserID",
-})
-
-if err.(Error).Message == RateLimitExceeded {
-    // handle rate limiting logic
 }
 
 // Or extend usage by initializing a sidecar proxy for all your
 // applications: (http://localhost:8080/limiter)
 err = rateLimiter.StartServer()
 if err != nil {
-    log.Fatalf("unable to start rate limiting server %v", err)
+    return errors.New("unable to start rate limiting server")
 }
+return err
 ```
 
 # Development
